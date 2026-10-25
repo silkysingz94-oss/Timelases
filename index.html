@@ -1,0 +1,827 @@
+```html
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+
+const state = {
+  all: [],
+  filtered: [],
+  ordered: [],
+  geoLayer: null,
+  featureLayers: new Map(),
+  selected: null,
+  currentStep: 0,
+  timer: null,
+  playing: false,
+  basemap: null,
+  chart: null,
+  dataName: "",
+  aliases: {}
+};
+
+const FIELD_CANDIDATES = {
+  region: ["region", "regionname", "region_name", "rco", "admin1", "admin_1", "division"],
+  district: ["district", "districtname", "district_name", "lganame", "lga", "admin2", "admin_2", "localgovernmentarea"],
+  ward: ["ward", "wardname", "ward_name", "admin3", "admin_3"],
+  ea: ["feacode", "eacode", "ea_code", "eaname", "ea_name", "enumerationarea", "enumeration_area", "ea", "code"],
+  population: ["sum_pop", "population", "pop_total", "total_population", "pop", "pop2023", "pop_2023"],
+  households: ["sum_hhs", "households", "hh_total", "total_households", "hh", "household"]
+};
+
+function norm(value) {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function properties(feature) {
+  return feature && feature.properties && typeof feature.properties === "object"
+    ? feature.properties : {};
+}
+
+function discoverFields() {
+  const first = state.all.find(f => f && f.type === "Feature");
+  const keys = first ? Object.keys(properties(first)) : [];
+  const byNorm = new Map(keys.map(k => [norm(k), k]));
+
+  for (const [type, candidates] of Object.entries(FIELD_CANDIDATES)) {
+    state.aliases[type] = null;
+    for (const candidate of candidates) {
+      if (byNorm.has(norm(candidate))) {
+        state.aliases[type] = byNorm.get(norm(candidate));
+        break;
+      }
+    }
+  }
+
+  if (!state.aliases.region) state.aliases.region = fuzzyField(keys, ["region", "rco"]);
+  if (!state.aliases.district) state.aliases.district = fuzzyField(keys, ["district", "lga"]);
+  if (!state.aliases.ward) state.aliases.ward = fuzzyField(keys, ["ward"]);
+  if (!state.aliases.ea) state.aliases.ea = fuzzyField(keys, ["feacode", "eaname", "eacode"]);
+  if (!state.aliases.population) state.aliases.population = fuzzyField(keys, ["population", "sum_pop"]);
+  if (!state.aliases.households) state.aliases.households = fuzzyField(keys, ["household", "sum_hhs"]);
+}
+
+function fuzzyField(keys, terms) {
+  for (const key of keys) {
+    const k = norm(key);
+    if (terms.some(t => k.includes(norm(t)))) return key;
+  }
+  return null;
+}
+
+function val(feature, type) {
+  const key = state.aliases[type];
+  return key ? properties(feature)[key] : null;
+}
+
+function numeric(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(String(value).replace(/,/g, "").trim());
+  return Number.isFinite(n) ? n : null;
+}
+
+function fmt(value) {
+  return Number.isFinite(value) ? value.toLocaleString() : "—";
+}
+
+function eaName(feature, fallbackIndex = 0) {
+  const value = val(feature, "ea");
+  return value !== null && value !== undefined && String(value).trim() !== ""
+    ? String(value) : `EA ${fallbackIndex + 1}`;
+}
+
+function uniqueValues(features, type) {
+  const result = new Set();
+  for (const f of features) {
+    const v = val(f, type);
+    if (v !== null && v !== undefined && String(v).trim() !== "") {
+      result.add(String(v));
+    }
+  }
+  return [...result].sort((a, b) => a.localeCompare(b, undefined, {numeric:true}));
+}
+
+function setSelect(id, items, defaultLabel, preserve = true) {
+  const select = $(id);
+  const previous = preserve ? select.value : "";
+  select.replaceChildren();
+
+  const first = document.createElement("option");
+  first.value = "";
+  first.textContent = defaultLabel;
+  select.appendChild(first);
+
+  for (const item of items) {
+    const opt = document.createElement("option");
+    opt.value = item;
+    opt.textContent = item;
+    select.appendChild(opt);
+  }
+
+  if (items.includes(previous)) select.value = previous;
+}
+
+function refreshSelectors() {
+  const region = $("regionSelect").value;
+  const district = $("districtSelect").value;
+
+  const regionFeatures = state.all.filter(f => !region || String(val(f, "region") ?? "") === region);
+  setSelect("regionSelect", uniqueValues(state.all, "region"), "All regions", true);
+
+  const districtFeatures = regionFeatures.filter(f =>
+    !district || String(val(f, "district") ?? "") === district
+  );
+  setSelect("districtSelect", uniqueValues(regionFeatures, "district"), "All districts", true);
+
+  const wardFeatures = districtFeatures;
+  setSelect("wardSelect", uniqueValues(wardFeatures, "ward"), "All wards", true);
+}
+
+function updateSelectorsAfterRegion() {
+  const region = $("regionSelect").value;
+  const regionFeatures = state.all.filter(f =>
+    !region || String(val(f, "region") ?? "") === region
+  );
+  setSelect("districtSelect", uniqueValues(regionFeatures, "district"), "All districts", false);
+  updateSelectorsAfterDistrict();
+}
+
+function updateSelectorsAfterDistrict() {
+  const region = $("regionSelect").value;
+  const district = $("districtSelect").value;
+  const features = state.all.filter(f =>
+    (!region || String(val(f, "region") ?? "") === region) &&
+    (!district || String(val(f, "district") ?? "") === district)
+  );
+  setSelect("wardSelect", uniqueValues(features, "ward"), "All wards", false);
+}
+
+function matchesSearch(feature, query) {
+  if (!query) return true;
+  const p = properties(feature);
+  const searchable = [eaName(feature), ...Object.values(p)].join(" ").toLowerCase();
+  return searchable.includes(query.toLowerCase());
+}
+
+function applyFilters() {
+  stopAnimation();
+
+  const region = $("regionSelect").value;
+  const district = $("districtSelect").value;
+  const ward = $("wardSelect").value;
+  const query = $("searchInput").value.trim();
+
+  state.filtered = state.all.filter(f =>
+    (!region || String(val(f, "region") ?? "") === region) &&
+    (!district || String(val(f, "district") ?? "") === district) &&
+    (!ward || String(val(f, "ward") ?? "") === ward) &&
+    matchesSearch(f, query)
+  );
+
+  const order = $("orderSelect").value;
+  state.ordered = [...state.filtered];
+
+  if (order === "code") {
+    state.ordered.sort((a, b) => eaName(a).localeCompare(eaName(b), undefined, {numeric:true}));
+  } else if (order === "population") {
+    state.ordered.sort((a, b) =>
+      (numeric(val(b, "population")) ?? -Infinity) -
+      (numeric(val(a, "population")) ?? -Infinity)
+    );
+  }
+
+  state.currentStep = 0;
+  if (state.selected && !state.filtered.includes(state.selected)) {
+    state.selected = null;
+  }
+
+  $("timelineSlider").min = "0";
+  $("timelineSlider").max = String(Math.max(0, state.ordered.length - 1));
+  $("timelineSlider").value = "0";
+
+  redrawFeatures();
+  updateAnalytics();
+  updateTimeline();
+  updateSelected();
+  setMessage(state.filtered.length
+    ? `${state.filtered.length.toLocaleString()} enumeration areas match the filters`
+    : "No enumeration areas match these filters");
+
+  $("mapCount").textContent = `${state.filtered.length.toLocaleString()} EAs`;
+  $("filteredPill").textContent = `${state.filtered.length.toLocaleString()} matched`;
+}
+
+function styleFor(feature) {
+  const idx = state.ordered.indexOf(feature);
+  const current = idx === state.currentStep && state.ordered.length > 0;
+  const selected = feature === state.selected;
+  const mode = $("modeSelect").value;
+  const display = $("displaySelect").value;
+  const revealed = idx >= 0 && idx <= state.currentStep;
+
+  if (display === "selected" && !selected) {
+    return {color:"#9aa69e", weight:0.3, fillColor:"#dce5df", fillOpacity:0.03};
+  }
+  if (display === "animated" && !current && !selected) {
+    return {color:"#9aa69e", weight:0.3, fillColor:"#dce5df", fillOpacity:0.02};
+  }
+
+  if (selected) {
+    return {color:"#a62c31", weight:3, fillColor:"#e65d59", fillOpacity:0.78};
+  }
+  if (current) {
+    return {
+      color:"#795b08", weight:3,
+      fillColor: mode === "pulse" ? "#ff9f1c" : "#f5c542",
+      fillOpacity:0.88
+    };
+  }
+  if (mode === "reveal" && revealed) {
+    return {color:"#247747", weight:1.2, fillColor:"#45a56b", fillOpacity:0.55};
+  }
+
+  return {color:"#36769a", weight:0.7, fillColor:"#80b8d9", fillOpacity:0.42};
+}
+
+function redrawFeatures() {
+  if (state.geoLayer) {
+    state.geoLayer.remove();
+    state.geoLayer = null;
+  }
+  state.featureLayers.clear();
+
+  const collection = {
+    type:"FeatureCollection",
+    features:state.filtered
+  };
+
+  state.geoLayer = L.geoJSON(collection, {
+    style: feature => styleFor(feature),
+    onEachFeature: (feature, layer) => {
+      state.featureLayers.set(feature, layer);
+      const name = eaName(feature, state.filtered.indexOf(feature));
+      layer.bindTooltip(name, {sticky:true, direction:"auto"});
+      layer.on("click", () => {
+        state.selected = feature;
+        updateSelected();
+        updateLayerStyles();
+        const idx = state.ordered.indexOf(feature);
+        if (idx >= 0) {
+          state.currentStep = idx;
+          $("timelineSlider").value = String(idx);
+          updateTimeline();
+          updateLayerStyles();
+        }
+      });
+    }
+  }).addTo(map);
+
+  updateLayerStyles();
+}
+
+function updateLayerStyles() {
+  if (!state.geoLayer) return;
+
+  state.geoLayer.eachLayer(layer => {
+    const feature = layer.feature;
+    layer.setStyle(styleFor(feature));
+    if (feature === state.selected) layer.bringToFront();
+    else if (feature === state.ordered[state.currentStep]) layer.bringToFront();
+  });
+}
+
+function setMessage(message) {
+  $("mapMessage").textContent = message || "";
+}
+
+function updateTimeline() {
+  const total = state.ordered.length;
+  const idx = total ? Math.min(state.currentStep, total - 1) : 0;
+  $("stepDisplay").textContent = total ? `${idx + 1} / ${total}` : "0 / 0";
+  $("timelineSlider").value = String(idx);
+  $("progressBar").style.width = total > 1 ? `${idx / (total - 1) * 100}%` : (total ? "100%" : "0%");
+  $("currentEaLabel").textContent = total
+    ? `Current EA: ${eaName(state.ordered[idx], idx)}`
+    : "No EA selected for animation.";
+  $("previousBtn").disabled = !total;
+  $("nextBtn").disabled = !total;
+  $("playBtn").disabled = total < 1;
+  $("restartBtn").disabled = total < 1;
+}
+
+function goToStep(index) {
+  if (!state.ordered.length) return;
+  state.currentStep = Math.max(0, Math.min(index, state.ordered.length - 1));
+  $("timelineSlider").value = String(state.currentStep);
+  updateTimeline();
+  updateLayerStyles();
+
+  const feature = state.ordered[state.currentStep];
+  if (feature) {
+    $("currentEaLabel").textContent =
+      `Current EA: ${eaName(feature, state.currentStep)}`;
+  }
+}
+
+function stopAnimation() {
+  if (state.timer !== null) {
+    clearTimeout(state.timer);
+    state.timer = null;
+  }
+  state.playing = false;
+  $("playBtn").textContent = "▶ Play";
+  $("animationStatus").textContent = "PAUSED";
+}
+
+function tick() {
+  if (!state.playing || !state.ordered.length) return;
+
+  if (state.currentStep >= state.ordered.length - 1) {
+    state.currentStep = 0;
+  } else {
+    state.currentStep += 1;
+  }
+
+  $("timelineSlider").value = String(state.currentStep);
+  updateTimeline();
+  updateLayerStyles();
+
+  const delay = Number($("speedSelect").value) || 650;
+  state.timer = setTimeout(tick, delay);
+}
+
+function playAnimation() {
+  if (!state.ordered.length) {
+    setMessage("Load GeoJSON data before starting the animation.");
+    return;
+  }
+  if (state.playing) return;
+
+  if (state.currentStep >= state.ordered.length - 1) {
+    state.currentStep = -1;
+  }
+  state.playing = true;
+  $("playBtn").textContent = "Ⅱ Pause";
+  $("animationStatus").textContent = "PLAYING";
+  tick();
+}
+
+function resetFilters() {
+  stopAnimation();
+  $("regionSelect").value = "";
+  $("districtSelect").value = "";
+  $("wardSelect").value = "";
+  $("searchInput").value = "";
+  $("modeSelect").value = "reveal";
+  $("displaySelect").value = "all";
+  $("orderSelect").value = "original";
+  $("speedSelect").value = "650";
+  updateSelectorsAfterRegion();
+  applyFilters();
+  if (state.geoLayer && state.geoLayer.getLayers().length) {
+    zoomToFiltered();
+  }
+}
+
+function zoomToFiltered() {
+  if (!state.geoLayer || !state.geoLayer.getLayers().length) {
+    setMessage("No filtered features available to zoom to.");
+    return;
+  }
+  try {
+    const bounds = state.geoLayer.getBounds();
+    if (bounds.isValid()) map.fitBounds(bounds, {padding:[20,20], maxZoom:15});
+  } catch (e) {
+    console.warn("Could not zoom to filtered features:", e);
+  }
+}
+
+function updateAnalytics() {
+  const features = state.filtered;
+  const pops = features.map(f => numeric(val(f, "population"))).filter(v => v !== null);
+  const hhs = features.map(f => numeric(val(f, "households"))).filter(v => v !== null);
+  const popSum = pops.reduce((a,b) => a+b, 0);
+  const hhSum = hhs.reduce((a,b) => a+b, 0);
+
+  $("totalEas").textContent = fmt(features.length);
+  $("totalPopulation").textContent = pops.length ? fmt(popSum) : "—";
+  $("totalHouseholds").textContent = hhs.length ? fmt(hhSum) : "—";
+  $("avgPopulation").textContent = pops.length ? fmt(popSum / pops.length) : "—";
+  $("summaryNote").textContent = pops.length
+    ? `Population values found for ${pops.length.toLocaleString()} of ${features.length.toLocaleString()} filtered EAs; household values found for ${hhs.length.toLocaleString()}.`
+    : "No recognised numeric population field was found. Check the source properties and field names.";
+
+  const top = features
+    .map((f, i) => ({name:eaName(f, i), pop:numeric(val(f, "population"))}))
+    .filter(x => x.pop !== null)
+    .sort((a,b) => b.pop-a.pop)
+    .slice(0,10)
+    .reverse();
+
+  if (state.chart) state.chart.destroy();
+  state.chart = new Chart($("populationChart"), {
+    type:"bar",
+    data:{
+      labels:top.map(x => x.name),
+      datasets:[{
+        label:"Population",
+        data:top.map(x => x.pop),
+        backgroundColor:"#3d9664",
+        borderColor:"#176b43",
+        borderWidth:1
+      }]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      indexAxis:"y",
+      plugins:{legend:{display:false}},
+      scales:{
+        x:{beginAtZero:true, ticks:{font:{size:9}}},
+        y:{ticks:{font:{size:9}}}
+      }
+    }
+  });
+
+  const missingGeom = state.all.filter(f => !f.geometry).length;
+  const missingEA = state.all.filter(f => {
+    const v = val(f, "ea");
+    return v === null || v === undefined || String(v).trim() === "";
+  }).length;
+  const duplicateNames = findDuplicateEA();
+  const popMissing = state.all.filter(f => numeric(val(f, "population")) === null).length;
+
+  $("qualityStatus").innerHTML = `
+    <strong>Loaded features:</strong> ${fmt(state.all.length)}<br>
+    <strong>Missing geometry:</strong> ${fmt(missingGeom)}<br>
+    <strong>Missing EA identifier:</strong> ${fmt(missingEA)}<br>
+    <strong>Repeated EA identifiers:</strong> ${fmt(duplicateNames)}<br>
+    <strong>Missing / nonnumeric population:</strong> ${fmt(popMissing)}<br>
+    <strong>Recognised fields:</strong> ${Object.entries(state.aliases)
+      .filter(([,v]) => v)
+      .map(([k,v]) => `${k}: ${escapeHtml(v)}`).join(" · ") || "No recognised fields"}
+  `;
+}
+
+function findDuplicateEA() {
+  if (!state.aliases.ea) return 0;
+  const seen = new Set();
+  let dup = 0;
+  for (const f of state.all) {
+    const v = String(val(f, "ea") ?? "").trim();
+    if (!v) continue;
+    if (seen.has(v)) dup++;
+    else seen.add(v);
+  }
+  return dup;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, c => ({
+    "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
+  }[c]));
+}
+
+function updateSelected() {
+  const feature = state.selected;
+  const body = $("attributeTable");
+  body.replaceChildren();
+
+  if (!feature) {
+    $("selectedStatus").textContent = "Click an EA polygon to view its properties.";
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td>Selection</td><td>None</td>";
+    body.appendChild(tr);
+    return;
+  }
+
+  const p = properties(feature);
+  $("selectedStatus").textContent = `Selected: ${eaName(feature, state.filtered.indexOf(feature))}`;
+
+  for (const [key, value] of Object.entries(p)) {
+    const tr = document.createElement("tr");
+    const td1 = document.createElement("td");
+    const td2 = document.createElement("td");
+    td1.textContent = key;
+    td2.textContent = value === null || value === undefined ? "—" :
+      typeof value === "object" ? JSON.stringify(value) : String(value);
+    tr.append(td1, td2);
+    body.appendChild(tr);
+  }
+
+  if (!Object.keys(p).length) {
+    body.innerHTML = "<tr><td>Properties</td><td>No attributes supplied</td></tr>";
+  }
+}
+
+function validateGeoJSON(data) {
+  if (!data || data.type !== "FeatureCollection" || !Array.isArray(data.features)) {
+    throw new Error("Expected a GeoJSON FeatureCollection containing a features array.");
+  }
+  const good = data.features.filter(f =>
+    f && f.type === "Feature" && f.geometry &&
+    ["Polygon","MultiPolygon"].includes(f.geometry.type)
+  );
+  if (!good.length) {
+    throw new Error("No Polygon or MultiPolygon features found in the GeoJSON.");
+  }
+  return good;
+}
+
+function setDataStatus(message, kind = "") {
+  const el = $("dataStatus");
+  el.className = "status" + (kind ? " " + kind : "");
+  el.textContent = message;
+}
+
+function loadGeoJSON(data, name = "GeoJSON") {
+  stopAnimation();
+  let features;
+  try {
+    features = validateGeoJSON(data);
+  } catch (err) {
+    setDataStatus(err.message, "error");
+    setMessage("Could not load GeoJSON data.");
+    return;
+  }
+
+  state.all = features;
+  state.dataName = name;
+  state.selected = null;
+  discoverFields();
+  updateSelectorsAfterRegion();
+
+  setDataStatus(
+    `Loaded ${features.length.toLocaleString()} polygon features from ${name}.`,
+    " "
+  );
+
+  applyFilters();
+  zoomToFiltered();
+  setMessage(`Loaded ${features.length.toLocaleString()} enumeration areas`);
+}
+
+async function loadDefaultData() {
+  setDataStatus("Trying to load Census_EAs_Geo.json…");
+  const candidates = [
+    "./Census_EAs_Geo.json",
+    "./Census_EAs_Geo.geojson",
+    "./data/Census_EAs_Geo.json",
+    "./data/Census_EAs_Geo.geojson"
+  ];
+
+  let lastError = null;
+  for (const url of candidates) {
+    try {
+      const response = await fetch(url, {cache:"no-store"});
+      if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+      const data = await response.json();
+      loadGeoJSON(data, url);
+      if (state.all.length) return;
+      lastError = new Error(`No valid features in ${url}`);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  setDataStatus(
+    `Automatic load failed. ${lastError ? lastError.message : ""} Upload the GeoJSON file manually, or check that the filename and repository path are correct.`,
+    "warn"
+  );
+  setMessage("Upload Census_EAs_Geo.json to display the map");
+}
+
+function downloadFile(filename, content, mime) {
+  const blob = new Blob([content], {type:mime});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function csvCell(value) {
+  const s = String(value ?? "");
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+function exportCSV() {
+  if (!state.filtered.length) return alert("No filtered records to export.");
+  const keys = [...new Set(state.filtered.flatMap(f => Object.keys(properties(f))))];
+  const rows = [keys.map(csvCell).join(",")];
+  for (const f of state.filtered) {
+    const p = properties(f);
+    rows.push(keys.map(k => csvCell(p[k] ?? "")).join(","));
+  }
+  downloadFile("GBoS_GEOAI_Census_EAs.csv", rows.join("\r\n"), "text/csv;charset=utf-8;");
+}
+
+function exportGeoJSON() {
+  if (!state.filtered.length) return alert("No filtered features to export.");
+  const fc = {type:"FeatureCollection", features:state.filtered};
+  downloadFile(
+    "GBoS_GEOAI_Census_EAs.geojson",
+    JSON.stringify(fc, null, 2),
+    "application/geo+json;charset=utf-8;"
+  );
+}
+
+function exportSummary() {
+  const popValues = state.filtered.map(f => numeric(val(f, "population"))).filter(v => v !== null);
+  const hhValues = state.filtered.map(f => numeric(val(f, "households"))).filter(v => v !== null);
+  const rows = [
+    ["Metric","Value"],
+    ["Source file",state.dataName],
+    ["Filtered enumeration areas",state.filtered.length],
+    ["Regions",uniqueValues(state.filtered,"region").length],
+    ["Districts",uniqueValues(state.filtered,"district").length],
+    ["Wards",uniqueValues(state.filtered,"ward").length],
+    ["Population total",popValues.length ? popValues.reduce((a,b)=>a+b,0) : ""],
+    ["Households total",hhValues.length ? hhValues.reduce((a,b)=>a+b,0) : ""],
+    ["Mean population per EA",popValues.length ? popValues.reduce((a,b)=>a+b,0)/popValues.length : ""]
+  ];
+  downloadFile(
+    "GBoS_GEOAI_Census_EA_Summary.csv",
+    rows.map(r => r.map(csvCell).join(",")).join("\r\n"),
+    "text/csv;charset=utf-8;"
+  );
+}
+
+/* Basemaps */
+const map = L.map("map", {zoomControl:true, preferCanvas:true})
+  .setView([-13.9, 15.3], 5);
+
+const baseLayers = {
+  street: L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom:19, attribution:"© OpenStreetMap contributors"
+  }),
+  satellite: L.tileLayer(
+    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    {maxZoom:19, attribution:"Tiles © Esri"}
+  ),
+  terrain: L.tileLayer(
+    "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+    {maxZoom:17, attribution:"© OpenTopoMap"}
+  ),
+  dark: L.tileLayer(
+    "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+    {maxZoom:19, attribution:"© OpenStreetMap contributors © CARTO"}
+  )
+};
+
+function setBasemap(name) {
+  if (!baseLayers[name]) return;
+  if (state.basemap) map.removeLayer(state.basemap);
+  state.basemap = baseLayers[name];
+  state.basemap.addTo(map);
+  state.basemap.bringToBack();
+}
+
+setBasemap("street");
+
+document.querySelectorAll("[data-basemap]").forEach(button => {
+  button.addEventListener("click", () => setBasemap(button.dataset.basemap));
+});
+
+$("homeMapBtn").addEventListener("click", () => {
+  map.setView([13.45, -16.58], 8);
+});
+
+$("loadDefaultBtn").addEventListener("click", loadDefaultData);
+
+$("clearDataBtn").addEventListener("click", () => {
+  stopAnimation();
+  state.all = [];
+  state.filtered = [];
+  state.ordered = [];
+  state.selected = null;
+  state.featureLayers.clear();
+  if (state.geoLayer) map.removeLayer(state.geoLayer);
+  state.geoLayer = null;
+  state.currentStep = 0;
+  ["regionSelect","districtSelect","wardSelect"].forEach((id, i) => {
+    setSelect(id, [], ["All regions","All districts","All wards"][i], false);
+  });
+  $("searchInput").value = "";
+  updateAnalytics();
+  updateTimeline();
+  updateSelected();
+  $("mapCount").textContent = "0 EAs";
+  $("filteredPill").textContent = "0 matched";
+  setDataStatus("Data cleared.");
+  setMessage("Load a GeoJSON file to begin");
+});
+
+$("dropZone").addEventListener("click", () => $("fileInput").click());
+$("dropZone").addEventListener("keydown", e => {
+  if (e.key === "Enter" || e.key === " ") $("fileInput").click();
+});
+$("fileInput").addEventListener("change", async e => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  try {
+    const data = JSON.parse(await file.text());
+    loadGeoJSON(data, file.name);
+  } catch (err) {
+    setDataStatus(`Could not read file: ${err.message}`, "error");
+  }
+  e.target.value = "";
+});
+
+$("dropZone").addEventListener("dragover", e => {
+  e.preventDefault();
+  $("dropZone").classList.add("drag");
+});
+$("dropZone").addEventListener("dragleave", () => $("dropZone").classList.remove("drag"));
+$("dropZone").addEventListener("drop", async e => {
+  e.preventDefault();
+  $("dropZone").classList.remove("drag");
+  const file = e.dataTransfer.files[0];
+  if (!file) return;
+  try {
+    const data = JSON.parse(await file.text());
+    loadGeoJSON(data, file.name);
+  } catch (err) {
+    setDataStatus(`Could not read file: ${err.message}`, "error");
+  }
+});
+
+$("regionSelect").addEventListener("change", () => {
+  updateSelectorsAfterRegion();
+  applyFilters();
+});
+$("districtSelect").addEventListener("change", () => {
+  updateSelectorsAfterDistrict();
+  applyFilters();
+});
+$("wardSelect").addEventListener("change", applyFilters);
+$("applyFiltersBtn").addEventListener("click", applyFilters);
+$("searchInput").addEventListener("input", () => {
+  clearTimeout(window.__searchDebounce);
+  window.__searchDebounce = setTimeout(applyFilters, 180);
+});
+$("resetFiltersBtn").addEventListener("click", resetFilters);
+$("zoomFilteredBtn").addEventListener("click", zoomToFiltered);
+$("fitAllBtn").addEventListener("click", () => {
+  if (state.all.length) {
+    const layer = L.geoJSON({type:"FeatureCollection",features:state.all});
+    const bounds = layer.getBounds();
+    if (bounds.isValid()) map.fitBounds(bounds, {padding:[15,15], maxZoom:13});
+  }
+});
+
+$("timelineSlider").addEventListener("input", e => {
+  stopAnimation();
+  goToStep(Number(e.target.value));
+  $("animationStatus").textContent = "PAUSED";
+});
+
+$("playBtn").addEventListener("click", () => {
+  if (state.playing) {
+    stopAnimation();
+    return;
+  }
+  playAnimation();
+});
+
+$("stopBtn").addEventListener("click", stopAnimation);
+$("previousBtn").addEventListener("click", () => {
+  stopAnimation();
+  goToStep(state.currentStep - 1);
+});
+$("nextBtn").addEventListener("click", () => {
+  stopAnimation();
+  if (state.ordered.length) {
+    goToStep((state.currentStep + 1) % state.ordered.length);
+  }
+});
+$("restartBtn").addEventListener("click", () => {
+  stopAnimation();
+  goToStep(0);
+});
+
+$("speedSelect").addEventListener("change", () => {
+  if (state.playing) {
+    stopAnimation();
+    playAnimation();
+  }
+});
+$("orderSelect").addEventListener("change", applyFilters);
+$("modeSelect").addEventListener("change", updateLayerStyles);
+$("displaySelect").addEventListener("change", updateLayerStyles);
+$("exportCsvBtn").addEventListener("click", exportCSV);
+$("exportGeoBtn").addEventListener("click", exportGeoJSON);
+$("exportSummaryBtn").addEventListener("click", exportSummary);
+
+map.on("click", () => {
+  // Keep the existing EA selection; map clicks outside polygons do not clear it.
+});
+
+updateAnalytics();
+updateTimeline();
+loadDefaultData();
+</script>
+```
